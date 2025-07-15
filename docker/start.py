@@ -289,7 +289,7 @@ running with 'migrate_config'. See the README for more details.
     # Monta os args finais com o prefixo do OpenTelemetry
     args = otel_prefix + args
 
-    environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://172.17.0.1:4317"
+    environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = "http://10.180.32.124:4317"
     
     if ownership is not None:
         args = ["gosu", ownership] + args

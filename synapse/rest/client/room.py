@@ -72,6 +72,12 @@ from synapse.util.cancellation import cancellable
 from synapse.util.events import generate_fake_event_id
 from synapse.util.stringutils import parse_and_validate_server_name
 
+from opentelemetry import trace
+
+# Acquire a tracer
+tracer = trace.get_tracer("synapse.tracer")
+
+
 if TYPE_CHECKING:
     from synapse.server import HomeServer
 
@@ -144,41 +150,54 @@ messsages_response_timer = Histogram(
 
 class TransactionRestServlet(RestServlet):
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.txns = HttpTransactionCache(hs)
+        with tracer.start_as_current_span("room.transactionrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.txns = HttpTransactionCache(hs)
 
 
 class RoomCreateRestServlet(TransactionRestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__(hs)
-        self._room_creation_handler = hs.get_room_creation_handler()
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.roomcreaterestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__(hs)
+            self._room_creation_handler = hs.get_room_creation_handler()
+            self.auth = hs.get_auth()
 
     def register(self, http_server: HttpServer) -> None:
-        PATTERNS = "/createRoom"
-        register_txn_path(self, PATTERNS, http_server)
+        with tracer.start_as_current_span("room.roomcreaterestservlet.register") as chield:
+            chield.set_attribute("handler_type", "register")
+            PATTERNS = "/createRoom"
+            register_txn_path(self, PATTERNS, http_server)
+
 
     async def on_PUT(
         self, request: SynapseRequest, txn_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request)
-        set_tag("txn_id", txn_id)
-        return await self.txns.fetch_or_execute_request(
-            request, requester, self._do, request, requester
-        )
+         with tracer.start_as_current_span("room.roomcreaterestservlet.onput") as chield:
+            chield.set_attribute("handler_type", "onput")
+            requester = await self.auth.get_user_by_req(request)
+            set_tag("txn_id", txn_id)
+            return await self.txns.fetch_or_execute_request(
+                request, requester, self._do, request, requester
+            )
 
     async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request)
-        return await self._do(request, requester)
+         with tracer.start_as_current_span("room.roomcreaterestservlet.onpost") as chield:
+            chield.set_attribute("handler_type", "onpost")
+            requester = await self.auth.get_user_by_req(request)
+            return await self._do(request, requester)
 
     async def _do(
         self, request: SynapseRequest, requester: Requester
     ) -> Tuple[int, JsonDict]:
-        room_id, _, _ = await self._room_creation_handler.create_room(
-            requester, self.get_room_config(request)
-        )
+        with tracer.start_as_current_span("room.roomcreaterestservlet.do") as chield:
+            chield.set_attribute("handler_type", "do")
+            room_id, _, _ = await self._room_creation_handler.create_room(
+                requester, self.get_room_config(request)
+            )
 
         return 200, {"room_id": room_id}
 
@@ -191,50 +210,56 @@ class RoomCreateRestServlet(TransactionRestServlet):
 class RoomStateEventRestServlet(RestServlet):
     CATEGORY = "Event sending requests"
 
+  
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.event_creation_handler = hs.get_event_creation_handler()
-        self.room_member_handler = hs.get_room_member_handler()
-        self.message_handler = hs.get_message_handler()
-        self.delayed_events_handler = hs.get_delayed_events_handler()
-        self.auth = hs.get_auth()
-        self._max_event_delay_ms = hs.config.server.max_event_delay_ms
-        self._spam_checker_module_callbacks = hs.get_module_api_callbacks().spam_checker
+        with tracer.start_as_current_span("room.roomstateeventrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.event_creation_handler = hs.get_event_creation_handler()
+            self.room_member_handler = hs.get_room_member_handler()
+            self.message_handler = hs.get_message_handler()
+            self.delayed_events_handler = hs.get_delayed_events_handler()
+            self.auth = hs.get_auth()
+            self._max_event_delay_ms = hs.config.server.max_event_delay_ms
+            self._spam_checker_module_callbacks = hs.get_module_api_callbacks().spam_checker
 
+ 
     def register(self, http_server: HttpServer) -> None:
-        # /rooms/$roomid/state/$eventtype
-        no_state_key = "/rooms/(?P<room_id>[^/]*)/state/(?P<event_type>[^/]*)$"
+        with tracer.start_as_current_span("room.roomstateeventrestservlet.register") as chield:
+            chield.set_attribute("handler_type", "register")
+            # /rooms/$roomid/state/$eventtype
+            no_state_key = "/rooms/(?P<room_id>[^/]*)/state/(?P<event_type>[^/]*)$"
 
-        # /rooms/$roomid/state/$eventtype/$statekey
-        state_key = (
-            "/rooms/(?P<room_id>[^/]*)/state/"
-            "(?P<event_type>[^/]*)/(?P<state_key>[^/]*)$"
-        )
+            # /rooms/$roomid/state/$eventtype/$statekey
+            state_key = (
+                "/rooms/(?P<room_id>[^/]*)/state/"
+                "(?P<event_type>[^/]*)/(?P<state_key>[^/]*)$"
+            )
 
-        http_server.register_paths(
-            "GET",
-            client_patterns(state_key, v1=True),
-            self.on_GET,
-            self.__class__.__name__,
-        )
-        http_server.register_paths(
-            "PUT",
-            client_patterns(state_key, v1=True),
-            self.on_PUT,
-            self.__class__.__name__,
-        )
-        http_server.register_paths(
-            "GET",
-            client_patterns(no_state_key, v1=True),
-            self.on_GET_no_state_key,
-            self.__class__.__name__,
-        )
-        http_server.register_paths(
-            "PUT",
-            client_patterns(no_state_key, v1=True),
-            self.on_PUT_no_state_key,
-            self.__class__.__name__,
-        )
+            http_server.register_paths(
+                "GET",
+                client_patterns(state_key, v1=True),
+                self.on_GET,
+                self.__class__.__name__,
+            )
+            http_server.register_paths(
+                "PUT",
+                client_patterns(state_key, v1=True),
+                self.on_PUT,
+                self.__class__.__name__,
+            )
+            http_server.register_paths(
+                "GET",
+                client_patterns(no_state_key, v1=True),
+                self.on_GET_no_state_key,
+                self.__class__.__name__,
+            )
+            http_server.register_paths(
+                "PUT",
+                client_patterns(no_state_key, v1=True),
+                self.on_PUT_no_state_key,
+                self.__class__.__name__,
+            )
 
     @cancellable
     def on_GET_no_state_key(
@@ -251,30 +276,32 @@ class RoomStateEventRestServlet(RestServlet):
     async def on_GET(
         self, request: SynapseRequest, room_id: str, event_type: str, state_key: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        format = parse_string(
-            request, "format", default="content", allowed_values=["content", "event"]
-        )
+        with tracer.start_as_current_span("room.roomstateeventrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            format = parse_string(
+                request, "format", default="content", allowed_values=["content", "event"]
+            )
 
-        msg_handler = self.message_handler
-        data = await msg_handler.get_room_data(
-            requester=requester,
-            room_id=room_id,
-            event_type=event_type,
-            state_key=state_key,
-        )
+            msg_handler = self.message_handler
+            data = await msg_handler.get_room_data(
+                requester=requester,
+                room_id=room_id,
+                event_type=event_type,
+                state_key=state_key,
+            )
 
-        if not data:
-            raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
+            if not data:
+                raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
 
-        if format == "event":
-            event = format_event_for_client_v2(data.get_dict())
-            return 200, event
-        elif format == "content":
-            return 200, data.get_dict()["content"]
+            if format == "event":
+                event = format_event_for_client_v2(data.get_dict())
+                return 200, event
+            elif format == "content":
+                return 200, data.get_dict()["content"]
 
-        # Format must be event or content, per the parse_string call above.
-        raise RuntimeError(f"Unknown format: {format:r}.")
+            # Format must be event or content, per the parse_string call above.
+            raise RuntimeError(f"Unknown format: {format:r}.")
 
     async def on_PUT(
         self,
@@ -284,93 +311,95 @@ class RoomStateEventRestServlet(RestServlet):
         state_key: str,
         txn_id: Optional[str] = None,
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
+        with tracer.start_as_current_span("room.roomstateeventrestservlet.onput") as chield:
+            chield.set_attribute("handler_type", "onput")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
 
-        if txn_id:
-            set_tag("txn_id", txn_id)
+            if txn_id:
+                set_tag("txn_id", txn_id)
 
-        content = parse_json_object_from_request(request)
+            content = parse_json_object_from_request(request)
 
-        is_requester_admin = await self.auth.is_server_admin(requester)
-        if not is_requester_admin:
-            spam_check = (
-                await self._spam_checker_module_callbacks.user_may_send_state_event(
-                    user_id=requester.user.to_string(),
+            is_requester_admin = await self.auth.is_server_admin(requester)
+            if not is_requester_admin:
+                spam_check = (
+                    await self._spam_checker_module_callbacks.user_may_send_state_event(
+                        user_id=requester.user.to_string(),
+                        room_id=room_id,
+                        event_type=event_type,
+                        state_key=state_key,
+                        content=content,
+                    )
+                )
+                if spam_check != self._spam_checker_module_callbacks.NOT_SPAM:
+                    raise SynapseError(
+                        403,
+                        "You are not permitted to send the state event",
+                        errcode=spam_check[0],
+                        additional_fields=spam_check[1],
+                    )
+
+            origin_server_ts = None
+            if requester.app_service:
+                origin_server_ts = parse_integer(request, "ts")
+
+            delay = _parse_request_delay(request, self._max_event_delay_ms)
+            if delay is not None:
+                delay_id = await self.delayed_events_handler.add(
+                    requester,
                     room_id=room_id,
                     event_type=event_type,
                     state_key=state_key,
-                    content=content,
-                )
-            )
-            if spam_check != self._spam_checker_module_callbacks.NOT_SPAM:
-                raise SynapseError(
-                    403,
-                    "You are not permitted to send the state event",
-                    errcode=spam_check[0],
-                    additional_fields=spam_check[1],
-                )
-
-        origin_server_ts = None
-        if requester.app_service:
-            origin_server_ts = parse_integer(request, "ts")
-
-        delay = _parse_request_delay(request, self._max_event_delay_ms)
-        if delay is not None:
-            delay_id = await self.delayed_events_handler.add(
-                requester,
-                room_id=room_id,
-                event_type=event_type,
-                state_key=state_key,
-                origin_server_ts=origin_server_ts,
-                content=content,
-                delay=delay,
-            )
-
-            set_tag("delay_id", delay_id)
-            ret = {"delay_id": delay_id}
-            return 200, ret
-
-        try:
-            if event_type == EventTypes.Member:
-                membership = content.get("membership", None)
-                if not isinstance(membership, str):
-                    raise SynapseError(400, "Invalid membership (must be a string)")
-
-                event_id, _ = await self.room_member_handler.update_membership(
-                    requester,
-                    target=UserID.from_string(state_key),
-                    room_id=room_id,
-                    action=membership,
-                    content=content,
                     origin_server_ts=origin_server_ts,
+                    content=content,
+                    delay=delay,
                 )
-            else:
-                event_dict: JsonDict = {
-                    "type": event_type,
-                    "content": content,
-                    "room_id": room_id,
-                    "sender": requester.user.to_string(),
-                }
 
-                if state_key is not None:
-                    event_dict["state_key"] = state_key
+                set_tag("delay_id", delay_id)
+                ret = {"delay_id": delay_id}
+                return 200, ret
 
-                if origin_server_ts is not None:
-                    event_dict["origin_server_ts"] = origin_server_ts
+            try:
+                if event_type == EventTypes.Member:
+                    membership = content.get("membership", None)
+                    if not isinstance(membership, str):
+                        raise SynapseError(400, "Invalid membership (must be a string)")
 
-                (
-                    event,
-                    _,
-                ) = await self.event_creation_handler.create_and_send_nonmember_event(
-                    requester, event_dict, txn_id=txn_id
-                )
-                event_id = event.event_id
-        except ShadowBanError:
-            event_id = generate_fake_event_id()
+                    event_id, _ = await self.room_member_handler.update_membership(
+                        requester,
+                        target=UserID.from_string(state_key),
+                        room_id=room_id,
+                        action=membership,
+                        content=content,
+                        origin_server_ts=origin_server_ts,
+                    )
+                else:
+                    event_dict: JsonDict = {
+                        "type": event_type,
+                        "content": content,
+                        "room_id": room_id,
+                        "sender": requester.user.to_string(),
+                    }
 
-        set_tag("event_id", event_id)
-        ret = {"event_id": event_id}
-        return 200, ret
+                    if state_key is not None:
+                        event_dict["state_key"] = state_key
+
+                    if origin_server_ts is not None:
+                        event_dict["origin_server_ts"] = origin_server_ts
+
+                    (
+                        event,
+                        _,
+                    ) = await self.event_creation_handler.create_and_send_nonmember_event(
+                        requester, event_dict, txn_id=txn_id
+                    )
+                    event_id = event.event_id
+            except ShadowBanError:
+                event_id = generate_fake_event_id()
+
+            set_tag("event_id", event_id)
+            ret = {"event_id": event_id}
+            return 200, ret
 
 
 # TODO: Needs unit testing for generic events + feedback
@@ -378,16 +407,20 @@ class RoomSendEventRestServlet(TransactionRestServlet):
     CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__(hs)
-        self.event_creation_handler = hs.get_event_creation_handler()
-        self.delayed_events_handler = hs.get_delayed_events_handler()
-        self.auth = hs.get_auth()
-        self._max_event_delay_ms = hs.config.server.max_event_delay_ms
+        with tracer.start_as_current_span("room.roomsendeventrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__(hs)
+            self.event_creation_handler = hs.get_event_creation_handler()
+            self.delayed_events_handler = hs.get_delayed_events_handler()
+            self.auth = hs.get_auth()
+            self._max_event_delay_ms = hs.config.server.max_event_delay_ms
 
     def register(self, http_server: HttpServer) -> None:
+        with tracer.start_as_current_span("room.roomsendeventrestservlet.register") as chield:
+            chield.set_attribute("handler_type", "register")
         # /rooms/$roomid/send/$event_type[/$txn_id]
-        PATTERNS = "/rooms/(?P<room_id>[^/]*)/send/(?P<event_type>[^/]*)"
-        register_txn_path(self, PATTERNS, http_server)
+            PATTERNS = "/rooms/(?P<room_id>[^/]*)/send/(?P<event_type>[^/]*)"
+            register_txn_path(self, PATTERNS, http_server)
 
     async def _do(
         self,
@@ -397,51 +430,53 @@ class RoomSendEventRestServlet(TransactionRestServlet):
         event_type: str,
         txn_id: Optional[str],
     ) -> Tuple[int, JsonDict]:
-        content = parse_json_object_from_request(request)
+        with tracer.start_as_current_span("room.roomsendeventrestservlet.do") as chield:
+            chield.set_attribute("handler_type", "do")
+            content = parse_json_object_from_request(request)
 
-        origin_server_ts = None
-        if requester.app_service:
-            origin_server_ts = parse_integer(request, "ts")
+            origin_server_ts = None
+            if requester.app_service:
+                origin_server_ts = parse_integer(request, "ts")
 
-        delay = _parse_request_delay(request, self._max_event_delay_ms)
-        if delay is not None:
-            delay_id = await self.delayed_events_handler.add(
-                requester,
-                room_id=room_id,
-                event_type=event_type,
-                state_key=None,
-                origin_server_ts=origin_server_ts,
-                content=content,
-                delay=delay,
-            )
+            delay = _parse_request_delay(request, self._max_event_delay_ms)
+            if delay is not None:
+                delay_id = await self.delayed_events_handler.add(
+                    requester,
+                    room_id=room_id,
+                    event_type=event_type,
+                    state_key=None,
+                    origin_server_ts=origin_server_ts,
+                    content=content,
+                    delay=delay,
+                )
 
-            set_tag("delay_id", delay_id)
-            ret = {"delay_id": delay_id}
-            return 200, ret
+                set_tag("delay_id", delay_id)
+                ret = {"delay_id": delay_id}
+                return 200, ret
 
-        event_dict: JsonDict = {
-            "type": event_type,
-            "content": content,
-            "room_id": room_id,
-            "sender": requester.user.to_string(),
-        }
+            event_dict: JsonDict = {
+                "type": event_type,
+                "content": content,
+                "room_id": room_id,
+                "sender": requester.user.to_string(),
+            }
 
-        if origin_server_ts is not None:
-            event_dict["origin_server_ts"] = origin_server_ts
+            if origin_server_ts is not None:
+                event_dict["origin_server_ts"] = origin_server_ts
 
-        try:
-            (
-                event,
-                _,
-            ) = await self.event_creation_handler.create_and_send_nonmember_event(
-                requester, event_dict, txn_id=txn_id
-            )
-            event_id = event.event_id
-        except ShadowBanError:
-            event_id = generate_fake_event_id()
+            try:
+                (
+                    event,
+                    _,
+                ) = await self.event_creation_handler.create_and_send_nonmember_event(
+                    requester, event_dict, txn_id=txn_id
+                )
+                event_id = event.event_id
+            except ShadowBanError:
+                event_id = generate_fake_event_id()
 
-        set_tag("event_id", event_id)
-        return 200, {"event_id": event_id}
+            set_tag("event_id", event_id)
+            return 200, {"event_id": event_id}
 
     async def on_POST(
         self,
@@ -449,25 +484,29 @@ class RoomSendEventRestServlet(TransactionRestServlet):
         room_id: str,
         event_type: str,
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        return await self._do(request, requester, room_id, event_type, None)
+        with tracer.start_as_current_span("room.roomsendeventrestservlet.onpost") as chield:
+            chield.set_attribute("handler_type", "onpost")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            return await self._do(request, requester, room_id, event_type, None)
 
     async def on_PUT(
         self, request: SynapseRequest, room_id: str, event_type: str, txn_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        set_tag("txn_id", txn_id)
+        with tracer.start_as_current_span("room.roomsendeventrestservlet.onput") as chield:
+            chield.set_attribute("handler_type", "onput")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            set_tag("txn_id", txn_id)
 
-        return await self.txns.fetch_or_execute_request(
-            request,
-            requester,
-            self._do,
-            request,
-            requester,
-            room_id,
-            event_type,
-            txn_id,
-        )
+            return await self.txns.fetch_or_execute_request(
+                request,
+                requester,
+                self._do,
+                request,
+                requester,
+                room_id,
+                event_type,
+                txn_id,
+            )
 
 
 def _parse_request_delay(
@@ -518,14 +557,18 @@ class JoinRoomAliasServlet(ResolveRoomIdMixin, TransactionRestServlet):
     CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__(hs)
-        super(ResolveRoomIdMixin, self).__init__(hs)  # ensure the Mixin is set up
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.joinroomaliasservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__(hs)
+            super(ResolveRoomIdMixin, self).__init__(hs)  # ensure the Mixin is set up
+            self.auth = hs.get_auth()
 
     def register(self, http_server: HttpServer) -> None:
-        # /join/$room_identifier[/$txn_id]
-        PATTERNS = "/join/(?P<room_identifier>[^/]*)"
-        register_txn_path(self, PATTERNS, http_server)
+        with tracer.start_as_current_span("room.joinroomaliasservlet.register") as chield:
+            chield.set_attribute("handler_type", "register")
+            # /join/$room_identifier[/$txn_id]
+            PATTERNS = "/join/(?P<room_identifier>[^/]*)"
+            register_txn_path(self, PATTERNS, http_server)
 
     async def _do(
         self,
@@ -534,51 +577,57 @@ class JoinRoomAliasServlet(ResolveRoomIdMixin, TransactionRestServlet):
         room_identifier: str,
         txn_id: Optional[str],
     ) -> Tuple[int, JsonDict]:
-        content = parse_json_object_from_request(request, allow_empty_body=True)
+        with tracer.start_as_current_span("room.joinroomaliasservlet.do") as chield:
+            chield.set_attribute("handler_type", "do")
+            content = parse_json_object_from_request(request, allow_empty_body=True)
 
-        # twisted.web.server.Request.args is incorrectly defined as Optional[Any]
-        args: Dict[bytes, List[bytes]] = request.args  # type: ignore
-        # Prefer via over server_name (deprecated with MSC4156)
-        remote_room_hosts = parse_strings_from_args(args, "via", required=False)
-        if remote_room_hosts is None:
-            remote_room_hosts = parse_strings_from_args(
-                args, "server_name", required=False
+            # twisted.web.server.Request.args is incorrectly defined as Optional[Any]
+            args: Dict[bytes, List[bytes]] = request.args  # type: ignore
+            # Prefer via over server_name (deprecated with MSC4156)
+            remote_room_hosts = parse_strings_from_args(args, "via", required=False)
+            if remote_room_hosts is None:
+                remote_room_hosts = parse_strings_from_args(
+                    args, "server_name", required=False
+                )
+            room_id, remote_room_hosts = await self.resolve_room_id(
+                room_identifier,
+                remote_room_hosts,
             )
-        room_id, remote_room_hosts = await self.resolve_room_id(
-            room_identifier,
-            remote_room_hosts,
-        )
 
-        await self.room_member_handler.update_membership(
-            requester=requester,
-            target=requester.user,
-            room_id=room_id,
-            action="join",
-            txn_id=txn_id,
-            remote_room_hosts=remote_room_hosts,
-            content=content,
-            third_party_signed=content.get("third_party_signed", None),
-        )
+            await self.room_member_handler.update_membership(
+                requester=requester,
+                target=requester.user,
+                room_id=room_id,
+                action="join",
+                txn_id=txn_id,
+                remote_room_hosts=remote_room_hosts,
+                content=content,
+                third_party_signed=content.get("third_party_signed", None),
+            )
 
-        return 200, {"room_id": room_id}
+            return 200, {"room_id": room_id}
 
     async def on_POST(
         self,
         request: SynapseRequest,
         room_identifier: str,
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        return await self._do(request, requester, room_identifier, None)
+        with tracer.start_as_current_span("room.joinroomaliasservlet.onpost") as chield:
+            chield.set_attribute("handler_type", "onpost")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            return await self._do(request, requester, room_identifier, None)
 
     async def on_PUT(
         self, request: SynapseRequest, room_identifier: str, txn_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        set_tag("txn_id", txn_id)
+        with tracer.start_as_current_span("room.joinroomaliasservlet.onput") as chield:
+            chield.set_attribute("handler_type", "onput")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            set_tag("txn_id", txn_id)
 
-        return await self.txns.fetch_or_execute_request(
-            request, requester, self._do, request, requester, room_identifier, txn_id
-        )
+            return await self.txns.fetch_or_execute_request(
+                request, requester, self._do, request, requester, room_identifier, txn_id
+            )
 
 
 # TODO: Needs unit testing
@@ -587,117 +636,122 @@ class PublicRoomListRestServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.hs = hs
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.publicroomlistrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.hs = hs
+            self.auth = hs.get_auth()
 
     async def on_GET(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
-        server = parse_string(request, "server")
-
-        try:
-            await self.auth.get_user_by_req(request, allow_guest=True)
-        except InvalidClientCredentialsError as e:
-            # Option to allow servers to require auth when accessing
-            # /publicRooms via CS API. This is especially helpful in private
-            # federations.
-            if not self.hs.config.server.allow_public_rooms_without_auth:
-                raise
-
-            # We allow people to not be authed if they're just looking at our
-            # room list, but require auth when we proxy the request.
-            # In both cases we call the auth function, as that has the side
-            # effect of logging who issued this request if an access token was
-            # provided.
-            if server:
-                raise e
-
-        limit: Optional[int] = parse_integer(request, "limit", 0)
-        since_token = parse_string(request, "since")
-
-        if limit == 0:
-            # zero is a special value which corresponds to no limit.
-            limit = None
-
-        handler = self.hs.get_room_list_handler()
-        if server and not self.hs.is_mine_server_name(server):
-            # Ensure the server is valid.
+        with tracer.start_as_current_span("room.publicroomlistrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            server = parse_string(request, "server")
             try:
-                parse_and_validate_server_name(server)
-            except ValueError:
-                raise SynapseError(
-                    400,
-                    "Invalid server name: %s" % (server,),
-                    Codes.INVALID_PARAM,
+                await self.auth.get_user_by_req(request, allow_guest=True)
+            except InvalidClientCredentialsError as e:
+                # Option to allow servers to require auth when accessing
+                # /publicRooms via CS API. This is especially helpful in private
+                # federations.
+                if not self.hs.config.server.allow_public_rooms_without_auth:
+                    raise
+
+                # We allow people to not be authed if they're just looking at our
+                # room list, but require auth when we proxy the request.
+                # In both cases we call the auth function, as that has the side
+                # effect of logging who issued this request if an access token was
+                # provided.
+                if server:
+                    raise e
+
+            limit: Optional[int] = parse_integer(request, "limit", 0)
+            since_token = parse_string(request, "since")
+
+            if limit == 0:
+                # zero is a special value which corresponds to no limit.
+                limit = None
+
+            handler = self.hs.get_room_list_handler()
+            if server and not self.hs.is_mine_server_name(server):
+                # Ensure the server is valid.
+                try:
+                    parse_and_validate_server_name(server)
+                except ValueError:
+                    raise SynapseError(
+                        400,
+                        "Invalid server name: %s" % (server,),
+                        Codes.INVALID_PARAM,
+                    )
+
+                data = await handler.get_remote_public_room_list(
+                    server, limit=limit, since_token=since_token
+                )
+            else:
+                data = await handler.get_local_public_room_list(
+                    limit=limit, since_token=since_token
                 )
 
-            data = await handler.get_remote_public_room_list(
-                server, limit=limit, since_token=since_token
-            )
-        else:
-            data = await handler.get_local_public_room_list(
-                limit=limit, since_token=since_token
-            )
-
-        return 200, data
+            return 200, data
 
     async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
-        await self.auth.get_user_by_req(request, allow_guest=True)
+        with tracer.start_as_current_span("room.publicroomlistrestservlet.onpost") as chield:
+            chield.set_attribute("handler_type", "onpost")
+            await self.auth.get_user_by_req(request, allow_guest=True)
 
-        server = parse_string(request, "server")
-        content = parse_json_object_from_request(request)
+            server = parse_string(request, "server")
+            content = parse_json_object_from_request(request)
 
-        limit: Optional[int] = int(content.get("limit", 100))
-        since_token = content.get("since", None)
-        search_filter = content.get("filter", None)
+            limit: Optional[int] = int(content.get("limit", 100))
+            since_token = content.get("since", None)
+            search_filter = content.get("filter", None)
 
-        include_all_networks = content.get("include_all_networks", False)
-        third_party_instance_id = content.get("third_party_instance_id", None)
+            include_all_networks = content.get("include_all_networks", False)
+            third_party_instance_id = content.get("third_party_instance_id", None)
 
-        if include_all_networks:
-            network_tuple = None
-            if third_party_instance_id is not None:
-                raise SynapseError(
-                    400, "Can't use include_all_networks with an explicit network"
+            if include_all_networks:
+                network_tuple = None
+                if third_party_instance_id is not None:
+                    raise SynapseError(
+                        400, "Can't use include_all_networks with an explicit network"
+                    )
+            elif third_party_instance_id is None:
+                network_tuple = ThirdPartyInstanceID(None, None)
+            else:
+                network_tuple = ThirdPartyInstanceID.from_string(third_party_instance_id)
+
+            if limit == 0:
+                # zero is a special value which corresponds to no limit.
+                limit = None
+
+            handler = self.hs.get_room_list_handler()
+            if server and not self.hs.is_mine_server_name(server):
+                # Ensure the server is valid.
+                try:
+                    parse_and_validate_server_name(server)
+                except ValueError:
+                    raise SynapseError(
+                        400,
+                        "Invalid server name: %s" % (server,),
+                        Codes.INVALID_PARAM,
+                    )
+
+                data = await handler.get_remote_public_room_list(
+                    server,
+                    limit=limit,
+                    since_token=since_token,
+                    search_filter=search_filter,
+                    include_all_networks=include_all_networks,
+                    third_party_instance_id=third_party_instance_id,
                 )
-        elif third_party_instance_id is None:
-            network_tuple = ThirdPartyInstanceID(None, None)
-        else:
-            network_tuple = ThirdPartyInstanceID.from_string(third_party_instance_id)
 
-        if limit == 0:
-            # zero is a special value which corresponds to no limit.
-            limit = None
-
-        handler = self.hs.get_room_list_handler()
-        if server and not self.hs.is_mine_server_name(server):
-            # Ensure the server is valid.
-            try:
-                parse_and_validate_server_name(server)
-            except ValueError:
-                raise SynapseError(
-                    400,
-                    "Invalid server name: %s" % (server,),
-                    Codes.INVALID_PARAM,
+            else:
+                data = await handler.get_local_public_room_list(
+                    limit=limit,
+                    since_token=since_token,
+                    search_filter=search_filter,
+                    network_tuple=network_tuple,
                 )
 
-            data = await handler.get_remote_public_room_list(
-                server,
-                limit=limit,
-                since_token=since_token,
-                search_filter=search_filter,
-                include_all_networks=include_all_networks,
-                third_party_instance_id=third_party_instance_id,
-            )
-
-        else:
-            data = await handler.get_local_public_room_list(
-                limit=limit,
-                since_token=since_token,
-                search_filter=search_filter,
-                network_tuple=network_tuple,
-            )
-
-        return 200, data
+            return 200, data
 
 
 # TODO: Needs unit testing
@@ -706,53 +760,57 @@ class RoomMemberListRestServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.message_handler = hs.get_message_handler()
-        self.auth = hs.get_auth()
-        self.store = hs.get_datastores().main
+        with tracer.start_as_current_span("room.roommemberlistrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.message_handler = hs.get_message_handler()
+            self.auth = hs.get_auth()
+            self.store = hs.get_datastores().main
 
     @cancellable
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
-        # TODO support Pagination stream API (limit/tokens)
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        handler = self.message_handler
+        with tracer.start_as_current_span("room.roommemberlistrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            # TODO support Pagination stream API (limit/tokens)
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            handler = self.message_handler
 
-        # request the state as of a given event, as identified by a stream token,
-        # for consistency with /messages etc.
-        # useful for getting the membership in retrospect as of a given /sync
-        # response.
-        at_token_string = parse_string(request, "at")
-        if at_token_string is None:
-            at_token = None
-        else:
-            at_token = await StreamToken.from_string(self.store, at_token_string)
+            # request the state as of a given event, as identified by a stream token,
+            # for consistency with /messages etc.
+            # useful for getting the membership in retrospect as of a given /sync
+            # response.
+            at_token_string = parse_string(request, "at")
+            if at_token_string is None:
+                at_token = None
+            else:
+                at_token = await StreamToken.from_string(self.store, at_token_string)
 
-        # let you filter down on particular memberships.
-        # XXX: this may not be the best shape for this API - we could pass in a filter
-        # instead, except filters aren't currently aware of memberships.
-        # See https://github.com/matrix-org/matrix-doc/issues/1337 for more details.
-        membership = parse_string(request, "membership")
-        not_membership = parse_string(request, "not_membership")
+            # let you filter down on particular memberships.
+            # XXX: this may not be the best shape for this API - we could pass in a filter
+            # instead, except filters aren't currently aware of memberships.
+            # See https://github.com/matrix-org/matrix-doc/issues/1337 for more details.
+            membership = parse_string(request, "membership")
+            not_membership = parse_string(request, "not_membership")
 
-        events = await handler.get_state_events(
-            room_id=room_id,
-            requester=requester,
-            at_token=at_token,
-            state_filter=StateFilter.from_types([(EventTypes.Member, None)]),
-        )
+            events = await handler.get_state_events(
+                room_id=room_id,
+                requester=requester,
+                at_token=at_token,
+                state_filter=StateFilter.from_types([(EventTypes.Member, None)]),
+            )
 
-        chunk = []
+            chunk = []
 
-        for event in events:
-            if (membership and event["content"].get("membership") != membership) or (
-                not_membership and event["content"].get("membership") == not_membership
-            ):
-                continue
-            chunk.append(event)
+            for event in events:
+                if (membership and event["content"].get("membership") != membership) or (
+                    not_membership and event["content"].get("membership") == not_membership
+                ):
+                    continue
+                chunk.append(event)
 
-        return 200, {"chunk": chunk}
+            return 200, {"chunk": chunk}
 
 
 # deprecated in favour of /members?membership=join?
@@ -762,20 +820,24 @@ class JoinedRoomMemberListRestServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.message_handler = hs.get_message_handler()
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.joinedroommemberlistrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.message_handler = hs.get_message_handler()
+            self.auth = hs.get_auth()
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request)
+        with tracer.start_as_current_span("room.joinedroommemberlistrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self.auth.get_user_by_req(request)
 
-        users_with_profile = await self.message_handler.get_joined_members(
-            requester, room_id
-        )
+            users_with_profile = await self.message_handler.get_joined_members(
+                requester, room_id
+            )
 
-        return 200, {"joined": users_with_profile}
+            return 200, {"joined": users_with_profile}
 
 
 # TODO: Needs better unit testing
@@ -787,60 +849,63 @@ class RoomMessageListRestServlet(RestServlet):
     CATEGORY = "Client API requests (ALL FOR SAME ROOM MUST GO TO SAME WORKER)"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self._hs = hs
-        self.clock = hs.get_clock()
-        self.pagination_handler = hs.get_pagination_handler()
-        self.auth = hs.get_auth()
-        self.store = hs.get_datastores().main
+        with tracer.start_as_current_span("room.roommessagelistrestservlet.__init__") as chield:
+            super().__init__()
+            self._hs = hs
+            self.clock = hs.get_clock()
+            self.pagination_handler = hs.get_pagination_handler()
+            self.auth = hs.get_auth()
+            self.store = hs.get_datastores().main
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
-        processing_start_time = self.clock.time_msec()
-        # Fire off and hope that we get a result by the end.
-        #
-        # We're using the mypy type ignore comment because the `@cached`
-        # decorator on `get_number_joined_users_in_room` doesn't play well with
-        # the type system. Maybe in the future, it can use some ParamSpec
-        # wizardry to fix it up.
-        room_member_count_deferred = run_in_background(  # type: ignore[call-overload]
-            self.store.get_number_joined_users_in_room,
-            room_id,
-        )
+        with tracer.start_as_current_span("room.roommessagelistrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            processing_start_time = self.clock.time_msec()
+            # Fire off and hope that we get a result by the end.
+            #
+            # We're using the mypy type ignore comment because the `@cached`
+            # decorator on `get_number_joined_users_in_room` doesn't play well with
+            # the type system. Maybe in the future, it can use some ParamSpec
+            # wizardry to fix it up.
+            room_member_count_deferred = run_in_background(  # type: ignore[call-overload]
+                self.store.get_number_joined_users_in_room,
+                room_id,
+            )
 
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        pagination_config = await PaginationConfig.from_request(
-            self.store, request, default_limit=10
-        )
-        # Twisted will have processed the args by now.
-        assert request.args is not None
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            pagination_config = await PaginationConfig.from_request(
+                self.store, request, default_limit=10
+            )
+            # Twisted will have processed the args by now.
+            assert request.args is not None
 
-        filter_json = parse_json(request, "filter", encoding="utf-8")
-        event_filter = Filter(self._hs, filter_json) if filter_json else None
+            filter_json = parse_json(request, "filter", encoding="utf-8")
+            event_filter = Filter(self._hs, filter_json) if filter_json else None
 
-        as_client_event = b"raw" not in request.args
-        if (
-            event_filter
-            and event_filter.filter_json.get("event_format", "client") == "federation"
-        ):
-            as_client_event = False
+            as_client_event = b"raw" not in request.args
+            if (
+                event_filter
+                and event_filter.filter_json.get("event_format", "client") == "federation"
+            ):
+                as_client_event = False
 
-        msgs = await self.pagination_handler.get_messages(
-            room_id=room_id,
-            requester=requester,
-            pagin_config=pagination_config,
-            as_client_event=as_client_event,
-            event_filter=event_filter,
-        )
+            msgs = await self.pagination_handler.get_messages(
+                room_id=room_id,
+                requester=requester,
+                pagin_config=pagination_config,
+                as_client_event=as_client_event,
+                event_filter=event_filter,
+            )
 
-        processing_end_time = self.clock.time_msec()
-        room_member_count = await make_deferred_yieldable(room_member_count_deferred)
-        messsages_response_timer.labels(
-            room_size=_RoomSize.from_member_count(room_member_count)
-        ).observe((processing_end_time - processing_start_time) / 1000)
+            processing_end_time = self.clock.time_msec()
+            room_member_count = await make_deferred_yieldable(room_member_count_deferred)
+            messsages_response_timer.labels(
+                room_size=_RoomSize.from_member_count(room_member_count)
+            ).observe((processing_end_time - processing_start_time) / 1000)
 
-        return 200, msgs
+            return 200, msgs
 
 
 # TODO: Needs unit testing
@@ -849,21 +914,25 @@ class RoomStateRestServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.message_handler = hs.get_message_handler()
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.roomstaterestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.message_handler = hs.get_message_handler()
+            self.auth = hs.get_auth()
 
     @cancellable
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, List[JsonDict]]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        # Get all the current state for this room
-        events = await self.message_handler.get_state_events(
-            room_id=room_id,
-            requester=requester,
-        )
-        return 200, events
+        with tracer.start_as_current_span("room.roomstaterestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            # Get all the current state for this room
+            events = await self.message_handler.get_state_events(
+                room_id=room_id,
+                requester=requester,
+            )
+            return 200, events
 
 
 # TODO: Needs unit testing
@@ -872,22 +941,26 @@ class RoomInitialSyncRestServlet(RestServlet):
     CATEGORY = "Sync requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.initial_sync_handler = hs.get_initial_sync_handler()
-        self.auth = hs.get_auth()
-        self.store = hs.get_datastores().main
+        with tracer.start_as_current_span("room.roominitialsyncrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.initial_sync_handler = hs.get_initial_sync_handler()
+            self.auth = hs.get_auth()
+            self.store = hs.get_datastores().main
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        pagination_config = await PaginationConfig.from_request(
-            self.store, request, default_limit=10
-        )
-        content = await self.initial_sync_handler.room_initial_sync(
-            room_id=room_id, requester=requester, pagin_config=pagination_config
-        )
-        return 200, content
+        with tracer.start_as_current_span("room.roominitialsyncrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            pagination_config = await PaginationConfig.from_request(
+                self.store, request, default_limit=10
+            )
+            content = await self.initial_sync_handler.room_initial_sync(
+                room_id=room_id, requester=requester, pagin_config=pagination_config
+            )
+            return 200, content
 
 
 class RoomEventServlet(RestServlet):
@@ -897,90 +970,94 @@ class RoomEventServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.clock = hs.get_clock()
-        self._store = hs.get_datastores().main
-        self._state = hs.get_state_handler()
-        self._storage_controllers = hs.get_storage_controllers()
-        self.event_handler = hs.get_event_handler()
-        self._event_serializer = hs.get_event_client_serializer()
-        self._relations_handler = hs.get_relations_handler()
-        self.auth = hs.get_auth()
-        self.content_keep_ms = hs.config.server.redaction_retention_period
-        self.msc2815_enabled = hs.config.experimental.msc2815_enabled
+        with tracer.start_as_current_span("room.roomeventservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.clock = hs.get_clock()
+            self._store = hs.get_datastores().main
+            self._state = hs.get_state_handler()
+            self._storage_controllers = hs.get_storage_controllers()
+            self.event_handler = hs.get_event_handler()
+            self._event_serializer = hs.get_event_client_serializer()
+            self._relations_handler = hs.get_relations_handler()
+            self.auth = hs.get_auth()
+            self.content_keep_ms = hs.config.server.redaction_retention_period
+            self.msc2815_enabled = hs.config.experimental.msc2815_enabled
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str, event_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
+        with tracer.start_as_current_span("room.roomeventservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
 
-        include_unredacted_content = self.msc2815_enabled and (
-            parse_string(
-                request,
-                "fi.mau.msc2815.include_unredacted_content",
-                allowed_values=("true", "false"),
+            include_unredacted_content = self.msc2815_enabled and (
+                parse_string(
+                    request,
+                    "fi.mau.msc2815.include_unredacted_content",
+                    allowed_values=("true", "false"),
+                )
+                == "true"
             )
-            == "true"
-        )
-        if include_unredacted_content and not await self.auth.is_server_admin(
-            requester
-        ):
-            auth_events = await self._storage_controllers.state.get_current_state(
-                room_id,
-                StateFilter.from_types(
-                    [
-                        POWER_KEY,
-                        CREATE_KEY,
-                    ]
-                ),
-            )
-
-            redact_level = event_auth.get_named_level(auth_events, "redact", 50)
-            user_level = event_auth.get_user_power_level(
-                requester.user.to_string(), auth_events
-            )
-            if user_level < redact_level:
-                raise SynapseError(
-                    403,
-                    "You don't have permission to view redacted events in this room.",
-                    errcode=Codes.FORBIDDEN,
+            if include_unredacted_content and not await self.auth.is_server_admin(
+                requester
+            ):
+                auth_events = await self._storage_controllers.state.get_current_state(
+                    room_id,
+                    StateFilter.from_types(
+                        [
+                            POWER_KEY,
+                            CREATE_KEY,
+                        ]
+                    ),
                 )
 
-        try:
-            event = await self.event_handler.get_event(
-                requester.user,
-                room_id,
-                event_id,
-                show_redacted=include_unredacted_content,
-            )
-        except AuthError:
-            # This endpoint is supposed to return a 404 when the requester does
-            # not have permission to access the event
-            # https://matrix.org/docs/spec/client_server/r0.5.0#get-matrix-client-r0-rooms-roomid-event-eventid
+                redact_level = event_auth.get_named_level(auth_events, "redact", 50)
+                user_level = event_auth.get_user_power_level(
+                    requester.user.to_string(), auth_events
+                )
+                if user_level < redact_level:
+                    raise SynapseError(
+                        403,
+                        "You don't have permission to view redacted events in this room.",
+                        errcode=Codes.FORBIDDEN,
+                    )
+
+            try:
+                event = await self.event_handler.get_event(
+                    requester.user,
+                    room_id,
+                    event_id,
+                    show_redacted=include_unredacted_content,
+                )
+            except AuthError:
+                # This endpoint is supposed to return a 404 when the requester does
+                # not have permission to access the event
+                # https://matrix.org/docs/spec/client_server/r0.5.0#get-matrix-client-r0-rooms-roomid-event-eventid
+                raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
+
+            if event:
+                if include_unredacted_content and await self._store.have_censored_event(
+                    event_id
+                ):
+                    raise UnredactedContentDeletedError(self.content_keep_ms)
+
+                # Ensure there are bundled aggregations available.
+                aggregations = await self._relations_handler.get_bundled_aggregations(
+                    [event], requester.user.to_string()
+                )
+
+                # per MSC2676, /rooms/{roomId}/event/{eventId}, should return the
+                # *original* event, rather than the edited version
+                event_dict = await self._event_serializer.serialize_event(
+                    event,
+                    self.clock.time_msec(),
+                    bundle_aggregations=aggregations,
+                    config=SerializeEventConfig(requester=requester),
+                )
+                return 200, event_dict
+
             raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
-
-        if event:
-            if include_unredacted_content and await self._store.have_censored_event(
-                event_id
-            ):
-                raise UnredactedContentDeletedError(self.content_keep_ms)
-
-            # Ensure there are bundled aggregations available.
-            aggregations = await self._relations_handler.get_bundled_aggregations(
-                [event], requester.user.to_string()
-            )
-
-            # per MSC2676, /rooms/{roomId}/event/{eventId}, should return the
-            # *original* event, rather than the edited version
-            event_dict = await self._event_serializer.serialize_event(
-                event,
-                self.clock.time_msec(),
-                bundle_aggregations=aggregations,
-                config=SerializeEventConfig(requester=requester),
-            )
-            return 200, event_dict
-
-        raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
 
 
 class RoomEventContextServlet(RestServlet):
@@ -990,94 +1067,108 @@ class RoomEventContextServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self._hs = hs
-        self.clock = hs.get_clock()
-        self.room_context_handler = hs.get_room_context_handler()
-        self._event_serializer = hs.get_event_client_serializer()
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.roomeventcontextservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self._hs = hs
+            self.clock = hs.get_clock()
+            self.room_context_handler = hs.get_room_context_handler()
+            self._event_serializer = hs.get_event_client_serializer()
+            self.auth = hs.get_auth()
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str, event_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
+        with tracer.start_as_current_span("room.roomeventcontextservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
 
-        limit = parse_integer(request, "limit", default=10)
+            limit = parse_integer(request, "limit", default=10)
 
-        # picking the API shape for symmetry with /messages
-        filter_json = parse_json(request, "filter", encoding="utf-8")
-        event_filter = Filter(self._hs, filter_json) if filter_json else None
+            # picking the API shape for symmetry with /messages
+            filter_json = parse_json(request, "filter", encoding="utf-8")
+            event_filter = Filter(self._hs, filter_json) if filter_json else None
 
-        event_context = await self.room_context_handler.get_event_context(
-            requester, room_id, event_id, limit, event_filter
-        )
+            event_context = await self.room_context_handler.get_event_context(
+                requester, room_id, event_id, limit, event_filter
+            )
 
-        if not event_context:
-            raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
+            if not event_context:
+                raise SynapseError(404, "Event not found.", errcode=Codes.NOT_FOUND)
 
-        time_now = self.clock.time_msec()
-        serializer_options = SerializeEventConfig(requester=requester)
-        results = {
-            "events_before": await self._event_serializer.serialize_events(
-                event_context.events_before,
-                time_now,
-                bundle_aggregations=event_context.aggregations,
-                config=serializer_options,
-            ),
-            "event": await self._event_serializer.serialize_event(
-                event_context.event,
-                time_now,
-                bundle_aggregations=event_context.aggregations,
-                config=serializer_options,
-            ),
-            "events_after": await self._event_serializer.serialize_events(
-                event_context.events_after,
-                time_now,
-                bundle_aggregations=event_context.aggregations,
-                config=serializer_options,
-            ),
-            "state": await self._event_serializer.serialize_events(
-                event_context.state,
-                time_now,
-                config=serializer_options,
-            ),
-            "start": event_context.start,
-            "end": event_context.end,
-        }
+            time_now = self.clock.time_msec()
+            serializer_options = SerializeEventConfig(requester=requester)
+            results = {
+                "events_before": await self._event_serializer.serialize_events(
+                    event_context.events_before,
+                    time_now,
+                    bundle_aggregations=event_context.aggregations,
+                    config=serializer_options,
+                ),
+                "event": await self._event_serializer.serialize_event(
+                    event_context.event,
+                    time_now,
+                    bundle_aggregations=event_context.aggregations,
+                    config=serializer_options,
+                ),
+                "events_after": await self._event_serializer.serialize_events(
+                    event_context.events_after,
+                    time_now,
+                    bundle_aggregations=event_context.aggregations,
+                    config=serializer_options,
+                ),
+                "state": await self._event_serializer.serialize_events(
+                    event_context.state,
+                    time_now,
+                    config=serializer_options,
+                ),
+                "start": event_context.start,
+                "end": event_context.end,
+            }
 
-        return 200, results
+            return 200, results
 
 
 class RoomForgetRestServlet(TransactionRestServlet):
     def __init__(self, hs: "HomeServer"):
-        super().__init__(hs)
-        self.room_member_handler = hs.get_room_member_handler()
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.roomforgetrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__(hs)
+            self.room_member_handler = hs.get_room_member_handler()
+            self.auth = hs.get_auth()
 
     def register(self, http_server: HttpServer) -> None:
-        PATTERNS = "/rooms/(?P<room_id>[^/]*)/forget"
-        register_txn_path(self, PATTERNS, http_server)
+        with tracer.start_as_current_span("room.roomforgetrestservlet.register") as chield:
+            chield.set_attribute("handler_type", "register")
+            PATTERNS = "/rooms/(?P<room_id>[^/]*)/forget"
+            register_txn_path(self, PATTERNS, http_server)
 
     async def _do(self, requester: Requester, room_id: str) -> Tuple[int, JsonDict]:
-        await self.room_member_handler.forget(user=requester.user, room_id=room_id)
+        with tracer.start_as_current_span("room.roomforgetrestservlet.do") as chield:
+            chield.set_attribute("handler_type", "do")
+            await self.room_member_handler.forget(user=requester.user, room_id=room_id)
 
-        return 200, {}
+            return 200, {}
 
     async def on_POST(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=False)
-        return await self._do(requester, room_id)
+        with tracer.start_as_current_span("room.roomforgetrestservlet.onpost") as chield:
+            chield.set_attribute("handler_type", "onpost")
+            requester = await self.auth.get_user_by_req(request, allow_guest=False)
+            return await self._do(requester, room_id)
 
     async def on_PUT(
         self, request: SynapseRequest, room_id: str, txn_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=False)
-        set_tag("txn_id", txn_id)
+        with tracer.start_as_current_span("room.roomforgetrestservlet.onput") as chield:
+            chield.set_attribute("handler_type", "onput")
+            requester = await self.auth.get_user_by_req(request, allow_guest=False)
+            set_tag("txn_id", txn_id)
 
-        return await self.txns.fetch_or_execute_request(
-            request, requester, self._do, requester, room_id
-        )
+            return await self.txns.fetch_or_execute_request(
+                request, requester, self._do, requester, room_id
+            )
 
 
 # TODO: Needs unit testing
@@ -1085,17 +1176,21 @@ class RoomMembershipRestServlet(TransactionRestServlet):
     CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__(hs)
-        self.room_member_handler = hs.get_room_member_handler()
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.roommembershiprestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__(hs)
+            self.room_member_handler = hs.get_room_member_handler()
+            self.auth = hs.get_auth()
 
     def register(self, http_server: HttpServer) -> None:
+        with tracer.start_as_current_span("room.roommembershiprestservlet.register") as chield:
+            chield.set_attribute("handler_type", "register")
         # /rooms/$roomid/[join|invite|leave|ban|unban|kick]
-        PATTERNS = (
-            "/rooms/(?P<room_id>[^/]*)/"
-            "(?P<membership_action>join|invite|leave|ban|unban|kick)"
-        )
-        register_txn_path(self, PATTERNS, http_server)
+            PATTERNS = (
+                "/rooms/(?P<room_id>[^/]*)/"
+                "(?P<membership_action>join|invite|leave|ban|unban|kick)"
+            )
+            register_txn_path(self, PATTERNS, http_server)
 
     async def _do(
         self,
@@ -1105,69 +1200,71 @@ class RoomMembershipRestServlet(TransactionRestServlet):
         membership_action: str,
         txn_id: Optional[str],
     ) -> Tuple[int, JsonDict]:
-        if requester.is_guest and membership_action not in {
-            Membership.JOIN,
-            Membership.LEAVE,
-        }:
-            raise AuthError(403, "Guest access not allowed")
+        with tracer.start_as_current_span("room.roommembershiprestservlet.do") as chield:
+            chield.set_attribute("handler_type", "do")
+            if requester.is_guest and membership_action not in {
+                Membership.JOIN,
+                Membership.LEAVE,
+            }:
+                raise AuthError(403, "Guest access not allowed")
 
-        content = parse_json_object_from_request(request, allow_empty_body=True)
+            content = parse_json_object_from_request(request, allow_empty_body=True)
 
-        if membership_action == "invite" and all(
-            key in content for key in ("medium", "address")
-        ):
-            if not all(key in content for key in ("id_server", "id_access_token")):
-                raise SynapseError(
-                    HTTPStatus.BAD_REQUEST,
-                    "`id_server` and `id_access_token` are required when doing 3pid invite",
-                    Codes.MISSING_PARAM,
-                )
+            if membership_action == "invite" and all(
+                key in content for key in ("medium", "address")
+            ):
+                if not all(key in content for key in ("id_server", "id_access_token")):
+                    raise SynapseError(
+                        HTTPStatus.BAD_REQUEST,
+                        "`id_server` and `id_access_token` are required when doing 3pid invite",
+                        Codes.MISSING_PARAM,
+                    )
+
+                try:
+                    await self.room_member_handler.do_3pid_invite(
+                        room_id,
+                        requester.user,
+                        content["medium"],
+                        content["address"],
+                        content["id_server"],
+                        requester,
+                        txn_id,
+                        content["id_access_token"],
+                    )
+                except ShadowBanError:
+                    # Pretend the request succeeded.
+                    pass
+                return 200, {}
+
+            target = requester.user
+            if membership_action in ["invite", "ban", "unban", "kick"]:
+                assert_params_in_dict(content, ["user_id"])
+                target = UserID.from_string(content["user_id"])
+
+            event_content = None
+            if "reason" in content:
+                event_content = {"reason": content["reason"]}
 
             try:
-                await self.room_member_handler.do_3pid_invite(
-                    room_id,
-                    requester.user,
-                    content["medium"],
-                    content["address"],
-                    content["id_server"],
-                    requester,
-                    txn_id,
-                    content["id_access_token"],
+                await self.room_member_handler.update_membership(
+                    requester=requester,
+                    target=target,
+                    room_id=room_id,
+                    action=membership_action,
+                    txn_id=txn_id,
+                    third_party_signed=content.get("third_party_signed", None),
+                    content=event_content,
                 )
             except ShadowBanError:
                 # Pretend the request succeeded.
                 pass
-            return 200, {}
 
-        target = requester.user
-        if membership_action in ["invite", "ban", "unban", "kick"]:
-            assert_params_in_dict(content, ["user_id"])
-            target = UserID.from_string(content["user_id"])
+            return_value = {}
 
-        event_content = None
-        if "reason" in content:
-            event_content = {"reason": content["reason"]}
+            if membership_action == "join":
+                return_value["room_id"] = room_id
 
-        try:
-            await self.room_member_handler.update_membership(
-                requester=requester,
-                target=target,
-                room_id=room_id,
-                action=membership_action,
-                txn_id=txn_id,
-                third_party_signed=content.get("third_party_signed", None),
-                content=event_content,
-            )
-        except ShadowBanError:
-            # Pretend the request succeeded.
-            pass
-
-        return_value = {}
-
-        if membership_action == "join":
-            return_value["room_id"] = room_id
-
-        return 200, return_value
+            return 200, return_value
 
     async def on_POST(
         self,
@@ -1175,41 +1272,49 @@ class RoomMembershipRestServlet(TransactionRestServlet):
         room_id: str,
         membership_action: str,
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        return await self._do(request, requester, room_id, membership_action, None)
+        with tracer.start_as_current_span("room.roommembershiprestservlet.onpost") as chield:
+            chield.set_attribute("handler_type", "onpost")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            return await self._do(request, requester, room_id, membership_action, None)
 
     async def on_PUT(
         self, request: SynapseRequest, room_id: str, membership_action: str, txn_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
-        set_tag("txn_id", txn_id)
+        with tracer.start_as_current_span("room.roommembershiprestservlet.onput") as chield:
+            chield.set_attribute("handler_type", "onput")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
+            set_tag("txn_id", txn_id)
 
-        return await self.txns.fetch_or_execute_request(
-            request,
-            requester,
-            self._do,
-            request,
-            requester,
-            room_id,
-            membership_action,
-            txn_id,
-        )
+            return await self.txns.fetch_or_execute_request(
+                request,
+                requester,
+                self._do,
+                request,
+                requester,
+                room_id,
+                membership_action,
+                txn_id,
+            )
 
 
 class RoomRedactEventRestServlet(TransactionRestServlet):
     CATEGORY = "Event sending requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__(hs)
-        self.event_creation_handler = hs.get_event_creation_handler()
-        self.auth = hs.get_auth()
-        self._store = hs.get_datastores().main
-        self._relation_handler = hs.get_relations_handler()
-        self._msc3912_enabled = hs.config.experimental.msc3912_enabled
+        with tracer.start_as_current_span("room.roomredacteventrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__(hs)
+            self.event_creation_handler = hs.get_event_creation_handler()
+            self.auth = hs.get_auth()
+            self._store = hs.get_datastores().main
+            self._relation_handler = hs.get_relations_handler()
+            self._msc3912_enabled = hs.config.experimental.msc3912_enabled
 
     def register(self, http_server: HttpServer) -> None:
-        PATTERNS = "/rooms/(?P<room_id>[^/]*)/redact/(?P<event_id>[^/]*)"
-        register_txn_path(self, PATTERNS, http_server)
+        with tracer.start_as_current_span("room.roomredacteventrestservlet.register") as chield:
+            chield.set_attribute("handler_type", "register")
+            PATTERNS = "/rooms/(?P<room_id>[^/]*)/redact/(?P<event_id>[^/]*)"
+            register_txn_path(self, PATTERNS, http_server)
 
     async def _do(
         self,
@@ -1219,85 +1324,87 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
         event_id: str,
         txn_id: Optional[str],
     ) -> Tuple[int, JsonDict]:
-        content = parse_json_object_from_request(request)
+        with tracer.start_as_current_span("room.roomredacteventrestservlet.do") as chield:
+            chield.set_attribute("handler_type", "do")
+            content = parse_json_object_from_request(request)
 
-        requester_suspended = await self._store.get_user_suspended_status(
-            requester.user.to_string()
-        )
+            requester_suspended = await self._store.get_user_suspended_status(
+                requester.user.to_string()
+            )
 
-        if requester_suspended:
-            event = await self._store.get_event(event_id, allow_none=True)
-            if event:
-                if event.sender != requester.user.to_string():
+            if requester_suspended:
+                event = await self._store.get_event(event_id, allow_none=True)
+                if event:
+                    if event.sender != requester.user.to_string():
+                        raise SynapseError(
+                            403,
+                            "You can only redact your own events while account is suspended.",
+                            Codes.USER_ACCOUNT_SUSPENDED,
+                        )
+
+            # Ensure the redacts property in the content matches the one provided in
+            # the URL.
+            room_version = await self._store.get_room_version(room_id)
+            if room_version.updated_redaction_rules:
+                if "redacts" in content and content["redacts"] != event_id:
                     raise SynapseError(
-                        403,
-                        "You can only redact your own events while account is suspended.",
-                        Codes.USER_ACCOUNT_SUSPENDED,
+                        400,
+                        "Cannot provide a redacts value incoherent with the event_id of the URL parameter",
+                        Codes.INVALID_PARAM,
+                    )
+                else:
+                    content["redacts"] = event_id
+
+            try:
+                with_relations = None
+                if self._msc3912_enabled and "org.matrix.msc3912.with_relations" in content:
+                    with_relations = content["org.matrix.msc3912.with_relations"]
+                    del content["org.matrix.msc3912.with_relations"]
+
+                # Check if there's an existing event for this transaction now (even though
+                # create_and_send_nonmember_event also does it) because, if there's one,
+                # then we want to skip the call to redact_events_related_to.
+                event = None
+                if txn_id:
+                    event = await self.event_creation_handler.get_event_from_transaction(
+                        requester, txn_id, room_id
                     )
 
-        # Ensure the redacts property in the content matches the one provided in
-        # the URL.
-        room_version = await self._store.get_room_version(room_id)
-        if room_version.updated_redaction_rules:
-            if "redacts" in content and content["redacts"] != event_id:
-                raise SynapseError(
-                    400,
-                    "Cannot provide a redacts value incoherent with the event_id of the URL parameter",
-                    Codes.INVALID_PARAM,
-                )
-            else:
-                content["redacts"] = event_id
+                # Event is not yet redacted, create a new event to redact it.
+                if event is None:
+                    event_dict = {
+                        "type": EventTypes.Redaction,
+                        "content": content,
+                        "room_id": room_id,
+                        "sender": requester.user.to_string(),
+                    }
+                    # Earlier room versions had a top-level redacts property.
+                    if not room_version.updated_redaction_rules:
+                        event_dict["redacts"] = event_id
 
-        try:
-            with_relations = None
-            if self._msc3912_enabled and "org.matrix.msc3912.with_relations" in content:
-                with_relations = content["org.matrix.msc3912.with_relations"]
-                del content["org.matrix.msc3912.with_relations"]
-
-            # Check if there's an existing event for this transaction now (even though
-            # create_and_send_nonmember_event also does it) because, if there's one,
-            # then we want to skip the call to redact_events_related_to.
-            event = None
-            if txn_id:
-                event = await self.event_creation_handler.get_event_from_transaction(
-                    requester, txn_id, room_id
-                )
-
-            # Event is not yet redacted, create a new event to redact it.
-            if event is None:
-                event_dict = {
-                    "type": EventTypes.Redaction,
-                    "content": content,
-                    "room_id": room_id,
-                    "sender": requester.user.to_string(),
-                }
-                # Earlier room versions had a top-level redacts property.
-                if not room_version.updated_redaction_rules:
-                    event_dict["redacts"] = event_id
-
-                (
-                    event,
-                    _,
-                ) = await self.event_creation_handler.create_and_send_nonmember_event(
-                    requester, event_dict, txn_id=txn_id
-                )
-
-                if with_relations:
-                    run_as_background_process(
-                        "redact_related_events",
-                        self._relation_handler.redact_events_related_to,
-                        requester=requester,
-                        event_id=event_id,
-                        initial_redaction_event=event,
-                        relation_types=with_relations,
+                    (
+                        event,
+                        _,
+                    ) = await self.event_creation_handler.create_and_send_nonmember_event(
+                        requester, event_dict, txn_id=txn_id
                     )
 
-            event_id = event.event_id
-        except ShadowBanError:
-            event_id = generate_fake_event_id()
+                    if with_relations:
+                        run_as_background_process(
+                            "redact_related_events",
+                            self._relation_handler.redact_events_related_to,
+                            requester=requester,
+                            event_id=event_id,
+                            initial_redaction_event=event,
+                            relation_types=with_relations,
+                        )
 
-        set_tag("event_id", event_id)
-        return 200, {"event_id": event_id}
+                event_id = event.event_id
+            except ShadowBanError:
+                event_id = generate_fake_event_id()
+
+            set_tag("event_id", event_id)
+            return 200, {"event_id": event_id}
 
     async def on_POST(
         self,
@@ -1305,18 +1412,22 @@ class RoomRedactEventRestServlet(TransactionRestServlet):
         room_id: str,
         event_id: str,
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request)
-        return await self._do(request, requester, room_id, event_id, None)
+        with tracer.start_as_current_span("room.roomredacteventrestservlet.onpost") as chield:
+            chield.set_attribute("handler_type", "onpost")
+            requester = await self.auth.get_user_by_req(request)
+            return await self._do(request, requester, room_id, event_id, None)
 
     async def on_PUT(
         self, request: SynapseRequest, room_id: str, event_id: str, txn_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request)
-        set_tag("txn_id", txn_id)
+        with tracer.start_as_current_span("room.roomredacteventrestservlet.onput") as chield:
+            chield.set_attribute("handler_type", "onput")
+            requester = await self.auth.get_user_by_req(request)
+            set_tag("txn_id", txn_id)
 
-        return await self.txns.fetch_or_execute_request(
-            request, requester, self._do, request, requester, room_id, event_id, txn_id
-        )
+            return await self.txns.fetch_or_execute_request(
+                request, requester, self._do, request, requester, room_id, event_id, txn_id
+            )
 
 
 class RoomTypingRestServlet(RestServlet):
@@ -1326,57 +1437,61 @@ class RoomTypingRestServlet(RestServlet):
     CATEGORY = "The typing stream"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.hs = hs
-        self.presence_handler = hs.get_presence_handler()
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.roomtypingrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.hs = hs
+            self.presence_handler = hs.get_presence_handler()
+            self.auth = hs.get_auth()
 
-        # If we're not on the typing writer instance we should scream if we get
-        # requests.
-        self._is_typing_writer = (
-            hs.get_instance_name() in hs.config.worker.writers.typing
-        )
+            # If we're not on the typing writer instance we should scream if we get
+            # requests.
+            self._is_typing_writer = (
+                hs.get_instance_name() in hs.config.worker.writers.typing
+            )
 
     async def on_PUT(
         self, request: SynapseRequest, room_id: str, user_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request)
+        with tracer.start_as_current_span("room.roomtypingrestservlet.onput") as chield:
+            chield.set_attribute("handler_type", "onput")
+            requester = await self.auth.get_user_by_req(request)
 
-        if not self._is_typing_writer:
-            raise Exception("Got /typing request on instance that is not typing writer")
+            if not self._is_typing_writer:
+                raise Exception("Got /typing request on instance that is not typing writer")
 
-        room_id = urlparse.unquote(room_id)
-        target_user = UserID.from_string(urlparse.unquote(user_id))
+            room_id = urlparse.unquote(room_id)
+            target_user = UserID.from_string(urlparse.unquote(user_id))
 
-        content = parse_json_object_from_request(request)
+            content = parse_json_object_from_request(request)
 
-        await self.presence_handler.bump_presence_active_time(
-            requester.user, requester.device_id
-        )
+            await self.presence_handler.bump_presence_active_time(
+                requester.user, requester.device_id
+            )
 
-        # Limit timeout to stop people from setting silly typing timeouts.
-        timeout = min(content.get("timeout", 30000), 120000)
+            # Limit timeout to stop people from setting silly typing timeouts.
+            timeout = min(content.get("timeout", 30000), 120000)
 
-        # Defer getting the typing handler since it will raise on WORKER_PATTERNS.
-        typing_handler = self.hs.get_typing_writer_handler()
+            # Defer getting the typing handler since it will raise on WORKER_PATTERNS.
+            typing_handler = self.hs.get_typing_writer_handler()
 
-        try:
-            if content["typing"]:
-                await typing_handler.started_typing(
-                    target_user=target_user,
-                    requester=requester,
-                    room_id=room_id,
-                    timeout=timeout,
-                )
-            else:
-                await typing_handler.stopped_typing(
-                    target_user=target_user, requester=requester, room_id=room_id
-                )
-        except ShadowBanError:
-            # Pretend this worked without error.
-            pass
+            try:
+                if content["typing"]:
+                    await typing_handler.started_typing(
+                        target_user=target_user,
+                        requester=requester,
+                        room_id=room_id,
+                        timeout=timeout,
+                    )
+                else:
+                    await typing_handler.stopped_typing(
+                        target_user=target_user, requester=requester, room_id=room_id
+                    )
+            except ShadowBanError:
+                # Pretend this worked without error.
+                pass
 
-        return 200, {}
+            return 200, {}
 
 
 class RoomAliasListServlet(RestServlet):
@@ -1389,20 +1504,24 @@ class RoomAliasListServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.auth = hs.get_auth()
-        self.directory_handler = hs.get_directory_handler()
+        with tracer.start_as_current_span("room.roomaliaslistservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.auth = hs.get_auth()
+            self.directory_handler = hs.get_directory_handler()
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request)
+        with tracer.start_as_current_span("room.roomaliaslistservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self.auth.get_user_by_req(request)
 
-        alias_list = await self.directory_handler.get_aliases_for_room(
-            requester, room_id
-        )
+            alias_list = await self.directory_handler.get_aliases_for_room(
+                requester, room_id
+            )
 
-        return 200, {"aliases": alias_list}
+            return 200, {"aliases": alias_list}
 
 
 class SearchRestServlet(RestServlet):
@@ -1410,19 +1529,23 @@ class SearchRestServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.search_handler = hs.get_search_handler()
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.searchrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.search_handler = hs.get_search_handler()
+            self.auth = hs.get_auth()
 
     async def on_POST(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request)
+        with tracer.start_as_current_span("room.searchrestservlet.onpost") as chield:
+            chield.set_attribute("handler_type", "onpost")
+            requester = await self.auth.get_user_by_req(request)
 
-        content = parse_json_object_from_request(request)
+            content = parse_json_object_from_request(request)
 
-        batch = parse_string(request, "next_batch")
-        results = await self.search_handler.search(requester, content, batch)
+            batch = parse_string(request, "next_batch")
+            results = await self.search_handler.search(requester, content, batch)
 
-        return 200, results
+            return 200, results
 
 
 class JoinedRoomsRestServlet(RestServlet):
@@ -1430,15 +1553,19 @@ class JoinedRoomsRestServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self.store = hs.get_datastores().main
-        self.auth = hs.get_auth()
+        with tracer.start_as_current_span("room.joinedroomsrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self.store = hs.get_datastores().main
+            self.auth = hs.get_auth()
 
     async def on_GET(self, request: SynapseRequest) -> Tuple[int, JsonDict]:
-        requester = await self.auth.get_user_by_req(request, allow_guest=True)
+        with tracer.start_as_current_span("room.joinedroomsrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self.auth.get_user_by_req(request, allow_guest=True)
 
-        room_ids = await self.store.get_rooms_for_user(requester.user.to_string())
-        return 200, {"joined_rooms": list(room_ids)}
+            room_ids = await self.store.get_rooms_for_user(requester.user.to_string())
+            return 200, {"joined_rooms": list(room_ids)}
 
 
 def register_txn_path(
@@ -1502,31 +1629,35 @@ class TimestampLookupRestServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self._auth = hs.get_auth()
-        self._store = hs.get_datastores().main
-        self.timestamp_lookup_handler = hs.get_timestamp_lookup_handler()
+        with tracer.start_as_current_span("room.timestamplookuprestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self._auth = hs.get_auth()
+            self._store = hs.get_datastores().main
+            self.timestamp_lookup_handler = hs.get_timestamp_lookup_handler()
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self._auth.get_user_by_req(request)
-        await self._auth.check_user_in_room_or_world_readable(room_id, requester)
+        with tracer.start_as_current_span("room.timestamplookuprestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self._auth.get_user_by_req(request)
+            await self._auth.check_user_in_room_or_world_readable(room_id, requester)
 
-        timestamp = parse_integer(request, "ts", required=True)
-        direction = parse_enum(request, "dir", Direction, default=Direction.FORWARDS)
+            timestamp = parse_integer(request, "ts", required=True)
+            direction = parse_enum(request, "dir", Direction, default=Direction.FORWARDS)
 
-        (
-            event_id,
-            origin_server_ts,
-        ) = await self.timestamp_lookup_handler.get_event_for_timestamp(
-            requester, room_id, timestamp, direction
-        )
+            (
+                event_id,
+                origin_server_ts,
+            ) = await self.timestamp_lookup_handler.get_event_for_timestamp(
+                requester, room_id, timestamp, direction
+            )
 
-        return 200, {
-            "event_id": event_id,
-            "origin_server_ts": origin_server_ts,
-        }
+            return 200, {
+                "event_id": event_id,
+                "origin_server_ts": origin_server_ts,
+            }
 
 
 class RoomHierarchyRestServlet(RestServlet):
@@ -1535,26 +1666,30 @@ class RoomHierarchyRestServlet(RestServlet):
     CATEGORY = "Client API requests"
 
     def __init__(self, hs: "HomeServer"):
-        super().__init__()
-        self._auth = hs.get_auth()
-        self._room_summary_handler = hs.get_room_summary_handler()
+        with tracer.start_as_current_span("room.roomhierarchyrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            super().__init__()
+            self._auth = hs.get_auth()
+            self._room_summary_handler = hs.get_room_summary_handler()
 
     async def on_GET(
         self, request: SynapseRequest, room_id: str
     ) -> Tuple[int, JsonDict]:
-        requester = await self._auth.get_user_by_req(request, allow_guest=True)
+        with tracer.start_as_current_span("room.roomhierarchyrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            requester = await self._auth.get_user_by_req(request, allow_guest=True)
 
-        max_depth = parse_integer(request, "max_depth")
-        limit = parse_integer(request, "limit")
+            max_depth = parse_integer(request, "max_depth")
+            limit = parse_integer(request, "limit")
 
-        return 200, await self._room_summary_handler.get_room_hierarchy(
-            requester,
-            room_id,
-            suggested_only=parse_boolean(request, "suggested_only", default=False),
-            max_depth=max_depth,
-            limit=limit,
-            from_token=parse_string(request, "from"),
-        )
+            return 200, await self._room_summary_handler.get_room_hierarchy(
+                requester,
+                room_id,
+                suggested_only=parse_boolean(request, "suggested_only", default=False),
+                max_depth=max_depth,
+                limit=limit,
+                from_token=parse_string(request, "from"),
+            )
 
 
 class RoomSummaryRestServlet(ResolveRoomIdMixin, RestServlet):
@@ -1574,32 +1709,36 @@ class RoomSummaryRestServlet(ResolveRoomIdMixin, RestServlet):
 
     def __init__(self, hs: "HomeServer"):
         super().__init__(hs)
-        self._auth = hs.get_auth()
-        self._room_summary_handler = hs.get_room_summary_handler()
+        with tracer.start_as_current_span("room.roomsummaryrestservlet.__init__") as chield:
+            chield.set_attribute("handler_type", "__init__")
+            self._auth = hs.get_auth()
+            self._room_summary_handler = hs.get_room_summary_handler()
 
     async def on_GET(
         self, request: SynapseRequest, room_identifier: str
     ) -> Tuple[int, JsonDict]:
-        try:
-            requester = await self._auth.get_user_by_req(request, allow_guest=True)
-            requester_user_id: Optional[str] = requester.user.to_string()
-        except MissingClientTokenError:
-            # auth is optional
-            requester_user_id = None
+        with tracer.start_as_current_span("room.roomsummaryrestservlet.onget") as chield:
+            chield.set_attribute("handler_type", "onget")
+            try:
+                requester = await self._auth.get_user_by_req(request, allow_guest=True)
+                requester_user_id: Optional[str] = requester.user.to_string()
+            except MissingClientTokenError:
+                # auth is optional
+                requester_user_id = None
 
-        # twisted.web.server.Request.args is incorrectly defined as Optional[Any]
-        args: Dict[bytes, List[bytes]] = request.args  # type: ignore
-        remote_room_hosts = parse_strings_from_args(args, "via", required=False)
-        room_id, remote_room_hosts = await self.resolve_room_id(
-            room_identifier,
-            remote_room_hosts,
-        )
+            # twisted.web.server.Request.args is incorrectly defined as Optional[Any]
+            args: Dict[bytes, List[bytes]] = request.args  # type: ignore
+            remote_room_hosts = parse_strings_from_args(args, "via", required=False)
+            room_id, remote_room_hosts = await self.resolve_room_id(
+                room_identifier,
+                remote_room_hosts,
+            )
 
-        return 200, await self._room_summary_handler.get_room_summary(
-            requester_user_id,
-            room_id,
-            remote_room_hosts,
-        )
+            return 200, await self._room_summary_handler.get_room_summary(
+                requester_user_id,
+                room_id,
+                remote_room_hosts,
+            )
 
 
 def register_servlets(hs: "HomeServer", http_server: HttpServer) -> None:
